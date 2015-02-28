@@ -1,0 +1,462 @@
+/*
+  ISSHS interface and control program
+  by Enoch Fu
+
+  Used with the Arduino Mega 2560
+  The circuit:
+ * LCD RS pin to digital pin 27
+ * LCD Enable pin to digital pin 26
+ * LCD D4 pin to digital pin 22
+ * LCD D5 pin to digital pin 23
+ * LCD D6 pin to digital pin 24
+ * LCD D7 pin to digital pin 25
+ * LCD R/W pin to ground
+ * 10K potentiometer:
+ * ends to +5V and ground
+ * wiper to LCD VO pin (pin 3)
+ * select button to digital pin 19
+ * down button to digital pin 18
+ * up button to digital pin 2
+ * standby button to digital pin 3
+ * 220 Ohm resistors from MOSFET gates to digital(PWM) pins 7,8,11,12
+ * TMP36 temperature sensor Vout pins to analog pins 0-3
+ * voltage divided battery to analog pin 4
+*/
+
+// Libraries
+#include <LiquidCrystal.h>
+LiquidCrystal lcd(27,26,22,23,24,25);
+#include <EEPROM.h>
+#include <PWM.h>
+#include "Timer.h"
+#include <Wire.h>
+
+// Periods of function calls
+#define N 50               // number of temperature readings to average
+#define tempReadRate 1000  // rate of temperature readings in milliseconds
+#define batReadRate 10000  // rate of battry readings in milliseconds
+#define heatRate 1000      // rate of DCM heating function calls in milliseconds
+// Timer object for attaching events to 
+Timer t;
+// I/O pins
+const int standby_pin = 3;
+const int up_pin = 2;
+const int down_pin = 18;
+const int select_pin = 19;
+const int tempSensPin[] = {0,1,2,3};
+const int moduleHeatPin[] = {7,8,11,12};
+const int batlvl_pin = 4;
+//const int bm_addr = 0x10;
+
+int batlvl = 100;
+// temperature variables
+byte moduleSetTemp[] = {70,70,70,70};        // set temperatures of each module
+float moduleTemp[] = {70.0,70.0,70.0,70.0};  // current temperature of each module
+float temps[4*N];                            // array of temperature readings for averaging
+float tempRate[] = {0.0,0.0,0.0,0.0};        // temperature rates of change
+int n = 0;                                   // index of temp readings
+// button variables
+boolean toggled = false;                    // heating status
+int buttonState[] = {0,0,0,0};              // state of each button
+int lastButtonState[] = {LOW,LOW,LOW,LOW};  // previous state of each button
+long lastDebounceTime = 0;                  // time (ms) of last button debounce
+long debounceDelay = 200;                   // amount of delay (ms) between button presses
+int selected = 0;                           // current module selected
+// heating variables
+int heatLvl = 127;                              // duty cycle (0-255) of PWM output
+int aggrLvl = 255;                              // aggresive heating level
+int apprLvl = 127;                              // approaching heating level
+boolean reached[] = {false,false,false,false};  // if set temperature has been reached
+int32_t freq = 5;                               // frequency of PWM output
+
+// Standby button ISR
+void standbyPress() {
+  if ((millis() - lastDebounceTime) < debounceDelay)
+    return;
+  noInterrupts();
+  lastDebounceTime = millis();
+  buttonState[0] = HIGH;
+}
+// Up button ISR
+void upPress() {
+  if ((millis() - lastDebounceTime) < debounceDelay)
+    return;
+  noInterrupts();
+  lastDebounceTime = millis();
+  buttonState[1] = HIGH;
+}
+// Down button ISR
+void downPress() {
+  if ((millis() - lastDebounceTime) < debounceDelay)
+    return;
+  noInterrupts();
+  lastDebounceTime = millis();
+  buttonState[2] = HIGH;
+}
+// Select button ISR
+void selectPress() {
+  if ((millis() - lastDebounceTime) < debounceDelay)
+    return;
+  noInterrupts();
+  lastDebounceTime = millis();
+  buttonState[3] = HIGH;
+}
+
+void setup() {
+  // Welcome message
+  lcd.begin(16,2);
+  lcd.print("Integ. Ski Suit");
+  lcd.setCursor(0,1);
+  lcd.print("Heating System");
+  
+  Serial.begin(9600);
+  Serial.println("Integ. Ski Suit\nHeating System");
+  
+  // Retrieve last set temperatures from EEPROM
+  for (int addr = 0; addr < 4; addr++) {
+    setTemp(EEPROM.read(addr),addr);
+  }
+  
+  // Initialize button pins as inputs
+  pinMode(standby_pin, INPUT);
+  pinMode(up_pin, INPUT);
+  pinMode(down_pin, INPUT);
+  pinMode(select_pin, INPUT);
+  
+  // Set PWM pins to required frequency
+  InitTimersSafe();
+  for (int i = 0; i < 4; i++) {
+    Serial.print("Setting frequency for heat pin ");
+    Serial.print(i);
+    Serial.print("...");
+    while (!SetPinFrequencySafe(moduleHeatPin[i], freq));
+    Serial.println("success");
+  }
+  // Attach interrupts for buttons
+  attachInterrupt(1, standbyPress, RISING);
+  attachInterrupt(0, upPress, RISING);
+  attachInterrupt(5, downPress, RISING);
+  attachInterrupt(4, selectPress, RISING);
+  
+  // Initialize temperature readings
+  for (int i = 0; i < N; i++) {
+    readTemp();
+  }
+  
+  delay(5000);
+  // Read battery level and display menu to LCD
+  //Wire.begin();
+  readBatlvl();
+  menu(selected);
+  
+  // Attach functions for reading temperature and battery and heating to timer
+  t.every(tempReadRate/N,readTemp);
+  t.every(batReadRate,readBatlvl);
+  t.every(heatRate,heat);
+  
+  Serial.println("setup complete\n");
+}
+
+void loop() {
+  // Check for button presses
+  buttonCheck();
+  // Service all events associated with the timer
+  t.update();
+}
+
+// Function for setting the temperature of a module
+byte setTemp(byte temp, byte module) {
+  if (temp >= 70 && temp <= 110) {
+    // Update temperature setting for the module
+    moduleSetTemp[module] = temp;
+    // Write temperature setting to EEPROM for retrieval on reset
+    EEPROM.write(module, temp);
+  }
+}
+
+// Function for reading battery level
+void readBatlvl() {
+  // STC3100 battery monitoring IC communication
+  /*
+  Wire.beginTransmission(bm_addr);
+  Wire.write(0);
+  Wire.endTransmission();
+  Wire.requestFrom(bm_addr, 1);
+  while (Wire.available() == 0);
+  batlvl = Wire.read();
+  */
+  // Read battery level from analog pin
+  batlvl = analogRead(batlvl_pin);
+  // Calculate percentage of 5V
+  batlvl = (int)(batlvl * 100.0 / 1023.0);
+  // Display battery level to LCD
+  lcd.setCursor(0,0);
+  lcd.print("BAT LVL:    ");
+  if (batlvl < 100) {
+    if (batlvl < 10) {
+      lcd.print(" ");
+    }
+    lcd.print(" ");
+  }
+  lcd.print(batlvl);
+  lcd.print("%");
+  Serial.print("Updating Batlvl: ");
+  Serial.print(batlvl);
+  Serial.println("\n");
+}
+
+// Function for reading temperatures from all modules
+void readTemp() {
+  int reading;
+  float voltage;
+  for (int i = 0; i < 4; i++) {
+    // read from temperature sensor analog pin
+    reading = analogRead(tempSensPin[i]);
+    // convert the reading to voltage
+    voltage = (reading * 5.0) / 1024.0;
+    // convert voltage to degrees celcius
+    float c = (voltage - 0.5) * 100.0;
+    // store in array
+    temps[N*i+n] = c;
+  }
+  // increment index
+  n++;
+  // loop index back to 0 if it reaches N and average temperature readings
+  if (n >= N) {
+    n = 0;
+    readAvgTemp();
+  }
+}
+
+// Function for averaging temperatures
+void readAvgTemp() {
+  float oldTemp;
+  float sum = 0;
+  Serial.print("Updating Temps: ");
+  for (int i = 0; i < 4; i++) {
+    // save old temperature average reading
+    oldTemp = moduleTemp[i];
+    // sum up temperature readings
+    for (int j = 0; j < N; j++) {
+      sum += temps[N*i+j];
+    }
+    // calculate average temperature reading and convert to degrees farenheit
+    Serial.print(sum / N);
+    Serial.print("C\t");
+    moduleTemp[i] = (sum / N) * 9.0 / 5.0 + 32.0;
+    // save temperature rate of change
+    tempRate[i] = moduleTemp[i] - oldTemp;
+    //Serial.print(moduleTemp[i]);
+    //Serial.print("F ");
+    // reset sum to 0
+    sum = 0;
+  }
+  Serial.print("\n                ");
+  for (int j = 0; j < 4; j++) {
+    Serial.print(moduleTemp[j]);
+    Serial.print("F\t");
+  }
+  Serial.println("\n");
+}
+
+// Function for displaying the menu to the LCD
+void menu(int module) {
+  // Move cursor to the first column of the second row
+  lcd.setCursor(0,1);
+  Serial.print("\nBAT LVL:    ");
+  Serial.print(batlvl);
+  Serial.println("%");
+  // print selected module to LCD
+  switch(module) {
+    case 0:
+      lcd.print("LEFT GLOVE: ");
+      Serial.print("LEFT GLOVE: ");
+      break;
+    case 1:
+      lcd.print("RIGHT GLOVE:");
+      Serial.print("RIGHT GLOVE:");
+      break;
+    case 2:
+      lcd.print("LEFT BOOT:  ");
+      Serial.print("LEFT BOOT:  ");
+      break;
+    case 3:
+      lcd.print("RIGHT BOOT: ");
+      Serial.print("RIGHT BOOT: ");
+      break;
+  }
+  // print the set temperature of the module to the LCD
+  if (moduleSetTemp[module] < 100) {
+    lcd.print(" ");
+  }
+  lcd.print(moduleSetTemp[module]);
+  lcd.print("F");
+  selected = module;
+  Serial.print(moduleSetTemp[module]);
+  Serial.println("F");
+}
+
+// Function for checking status of buttons
+void buttonCheck() {
+  // Wait until the time to the last button debounce is greater than the debounce delay to do anything
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (buttonState[0] == HIGH) {  // Check if standby button pressed
+      Serial.println("\nStandby button pressed!");
+      // invert toggled state and set the standby button state to low
+      toggled = !toggled;
+      buttonState[0] = LOW;
+      // reset all reached states to false and outputs to low if untoggled
+      for (int i = 0; i < 4; i++) {
+        reached[i] = false;
+        if (!toggled) digitalWrite(moduleHeatPin[i],LOW);
+      }
+      if (!toggled) lcd.noBlink();
+      interrupts();
+    } else if (buttonState[1] == HIGH) {  // Check if up button pressed
+      Serial.println("\nUp button pressed!");
+      // Increment the set temperature and update the menu
+      incTemp();
+      menu(selected);
+      // reset variables
+      buttonState[1] = LOW;
+      for (int i = 0; i < 4; i++) reached[i] = false;
+      interrupts();
+    } else if (buttonState[2] == HIGH) {  // Check if down button pressed
+      Serial.println("\nDown button pressed!");
+      // Decrement the set temperature and update the menu
+      decTemp();
+      menu(selected);
+      // reset variables
+      buttonState[2] = LOW;
+      for (int i = 0; i < 4; i++) reached[i] = false;
+      interrupts();
+    } else if (buttonState[3] == HIGH) {  // Check if the select button is pressed
+      Serial.println("\nSelect button pressed!");
+      // Update selected module and menu
+      select();
+      menu(selected);
+      // reset variables
+      buttonState[3] = LOW;
+      interrupts();
+    }
+  }
+}
+
+// Function for controlling the heating elements with PWM/DCM
+void heat() {
+  // Check if standby is toggled
+  if (toggled) {
+    // blink "F" if any of the modules have not reached their set temperatures
+    if (!reached[0] || !reached[1] || !reached[2] || !reached[3]) {
+      lcd.setCursor(15,1);
+      lcd.blink();
+    } else {  // turn off blinking otherwise
+      lcd.noBlink();
+    }
+    /*
+    // Adjust PWM/DCM for each module
+    for (int j=0; j < 4; j++) {
+      Serial.println(moduleTemp[j]);
+      // calculate the difference in temperature from current to set temperature
+      float diff = moduleTemp[j] - (float)moduleSetTemp[j];
+      if (diff < -20) {  // use aggressive heating level if colder by more than 20
+        Serial.print("aggresive heating at ");
+        heatLvl = aggrLvl;
+        pwmWrite(moduleHeatPin[j], heatLvl);
+        Serial.println(heatLvl);
+      } else if (diff < -10) {  // use approaching heating level if colder by more than 10
+        Serial.print("approuching heating at ");
+        heatLvl = apprLvl;
+        pwmWrite(moduleHeatPin[j], heatLvl);
+        Serial.println(heatLvl);
+      } else if (diff < -5 && tempRate[j] < 0) {  // increase duty cycle if temp falls more than 5 from set temp
+        Serial.println("buffer heating at ");
+        heatLvl += 5;
+        pwmWrite(moduleHeatPin[j], heatLvl);
+        Serial.println(heatLvl);
+      } else if (diff > -0.5 && diff < 0.5 && !reached[j]) {  // set reached to true if within .5
+        Serial.println("reached");
+        reached[j] = true;
+      } else if (diff > 20) {  // turn off heating if hotter by more than 20
+        Serial.println("cooling");
+        heatLvl = 0;
+        pwmWrite(moduleHeatPin[j], heatLvl);
+      } else if (diff > 10 && tempRate[j] < 0) {  // use approaching level if cooled to within 20
+        Serial.println("approuching cooling at ");
+        heatLvl = apprLvl;
+        pwmWrite(moduleHeatPin[j], heatLvl);
+        Serial.println(heatLvl);
+      } else if (diff > 5 && tempRate[j] > 0) {  // decrease duty cycle if temp rises more than 5 from set temp
+        Serial.println("buffer cooling at ");
+        heatLvl -= 5;
+        pwmWrite(moduleHeatPin[j], heatLvl);
+        Serial.println(heatLvl);
+      } else {  // maintain heat level
+        Serial.println("maintaining at ");
+        Serial.println(heatLvl);
+      }
+    }
+    
+    readTemp();
+    Serial.println(moduleTemp[3]);
+    float diff = moduleTemp[3] - (float)moduleSetTemp[3];
+    if (diff < -20) {
+      Serial.print("aggresive heating at ");
+      heatLvl = aggrLvl;
+      pwmWrite(moduleHeatPin[3], heatLvl);
+      Serial.println(heatlvl/255);
+    } else if (diff < -10) {
+      Serial.print("approuching heating at ");
+      heatLvl = apprLvl;
+      pwmWrite(moduleHeatPin[3], heatLvl);
+      Serial.println(heatlvl/255);
+    } else if (diff < -5 && tempRate[3] < 0) {
+      Serial.print("buffer heating at ");
+      heatLvl += 5;
+      pwmWrite(moduleHeatPin[3], heatLvl);
+      Serial.println(heatlvl/255);
+    } else if (diff > -0.5 && diff < 0.5 && !reached[j]) {
+      Serial.println("reached");
+      reached[j] = true;
+    } else if (diff > 20) {
+      Serial.print("cooling at ");
+      heatLvl = 0;
+      pwmWrite(moduleHeatPin[3], heatLvl);
+      Serial.println(heatlvl/255);
+    } else if (diff > 10) {
+      Serial.print("approuching cooling at ");
+      heatLvl = apprLvl;
+      pwmWrite(moduleHeatPin[3], heatLvl);
+      Serial.println(heatlvl/255);
+    } else if (diff > 5 && tempRate[3] > 0) {
+      Serial.print("buffer cooling at ");
+      heatLvl -= 5;
+      pwmWrite(moduleHeatPin[3], heatLvl);
+      Serial.println(heatlvl/255);
+    } else {
+      Serial.print("maintaining at ");
+      Serial.println(heatlvl/255);
+    }
+    */
+    Serial.println("heating");
+    pwmWrite(moduleHeatPin[3], 127);
+  }
+}
+
+// Function for incrementing the set temperature of the selected module by 5
+void incTemp() {
+  setTemp(moduleSetTemp[selected] + 5, selected);
+}
+// Function for decrementing the set temperature of the selected module by 5
+void decTemp() {
+  setTemp(moduleSetTemp[selected] - 5, selected);
+}
+// Function for incrementing the selected variable to the next menu number
+void select() {
+  if (selected < 3) {  // increments selected
+    selected++;
+  }
+  else {  // resets to 0 after 3
+    selected = 0;
+  }
+}
